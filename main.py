@@ -42,21 +42,54 @@ def handle_message(event):
     }
     
     # LINEのメッセージをDifyの「query」として送信
-    # ※プロンプト側で「Plan: Do:」を判別するように調整が必要です
+    # streaming: Agentアシスタント対応 / blocking: チャットアプリ向け
     data = {
-        "inputs": {}, # フォーム入力ではなく会話形式で送る場合
+        "inputs": {},
         "query": user_msg,
-        "response_mode": "blocking",
-        "user": user_id # LINEのユーザーIDを渡すと履歴が保持される
+        "response_mode": "streaming",
+        "user": user_id
     }
 
-    response = requests.post(f"{DIFY_BASE_URL}/chat-messages", headers=headers, data=json.dumps(data))
-    
-    if response.status_code == 200:
-        result = response.json()
-        reply_text = result.get('answer', 'エラーが発生しました。')
-    else:
-        reply_text = "Difyとの連携に失敗しました。"
+    try:
+        response = requests.post(
+            f"{DIFY_BASE_URL}/chat-messages",
+            headers=headers,
+            data=json.dumps(data),
+            timeout=120,
+            stream=True
+        )
+        
+        if response.status_code == 200:
+            # streamingレスポンスをパース（Chat: message / Agent: agent_message）
+            reply_text = ""
+            for line in response.iter_lines():
+                if line and line.startswith(b'data: '):
+                    try:
+                        payload = line[6:].decode()
+                        if payload.strip() == '[DONE]':
+                            break
+                        chunk = json.loads(payload)
+                        ev = chunk.get('event')
+                        if ev in ('message', 'agent_message'):
+                            reply_text += chunk.get('answer', '')
+                        elif ev == 'message_end':
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            if not reply_text:
+                reply_text = "応答を取得できませんでした。"
+        else:
+            error_detail = response.text
+            try:
+                err_json = response.json()
+                error_detail = err_json.get('message', error_detail)
+            except Exception:
+                pass
+            print(f"[Dify Error] status={response.status_code}, body={error_detail}")
+            reply_text = f"Difyとの連携に失敗しました。（{response.status_code}）"
+    except requests.exceptions.RequestException as e:
+        print(f"[Dify Error] Request failed: {e}")
+        reply_text = "Difyとの連携に失敗しました。（通信エラー）"
 
     # LINEに返信する
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
